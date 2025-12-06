@@ -1,0 +1,15 @@
+[
+    {
+      "path": "sql/revenue.sql",
+      "description": "売上(revenue)情報を集計したファクトテーブルを作成するSQL。office_id・product_id・売上日(sales_date)などの粒度で金額や税額を保持しており、売上推移やMRRなどの売上分析のベースとして使う。"
+    },
+    {
+      "path": "sql/office.sql",
+      "description": "事業者(オフィス)マスタテーブルを作成するSQL。office_id ごとの名称、所在地、業種、契約ステータスなどの属性情報を保持し、売上テーブルやコストテーブルと office_id で結合して、オフィス別の集計やフィルタに利用する。"
+    },
+    {
+      "path": "sql/cost.sql",
+      "description": "コスト(cost)情報を集計したファクトテーブルを作成するSQL。office_id・期間(月や日)などの単位で人件費・広告費・インフラ費などのコスト金額を保持し、売上テーブルと組み合わせて粗利や利益率を計算する際のベースとなる。"
+    }
+  ]
+  
