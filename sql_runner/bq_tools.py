@@ -18,6 +18,15 @@ DATA_PROJECT_ID = os.getenv("DATA_PROJECT_ID")
 GCP_DEFAULT_PROJECT = os.getenv("GOOGLE_CLOUD_PROJECT")
 BQ_LOCATION = os.getenv("BQ_LOCATION")  # 例: "asia-northeast1" / "US"
 
+# ---------------------------
+# Allowlist (hard-coded for now)
+#   Only allow querying tables in:
+#     bigquery-public-data.ncaa_basketball
+# ---------------------------
+
+ALLOW_PROJECT_ID = "bigquery-public-data"
+ALLOW_DATASET_ID = "ncaa_basketball"
+
 
 def _resolve_project_id(explicit_project_id: Optional[str]) -> Optional[str]:
     if explicit_project_id:
@@ -190,12 +199,49 @@ def validate_sql(raw_sql: str, *, default_limit: int = 1000) -> SqlValidationRes
 
 
 # ---------------------------
+# Allowlist validator (dry-run referenced tables)
+# ---------------------------
+
+def _validate_referenced_tables_allowlist(
+    referenced_tables: Optional[List[Dict[str, str]]],
+) -> Optional[str]:
+    """
+    referenced_tables: [{"projectId": "...", "datasetId": "...", "tableId": "..."} ...]
+    戻り値:
+      - None: OK
+      - "TOO_MANY_REFERENCED_TABLES": 参照が多すぎて安全に判定できないので拒否
+      - "<proj>.<dataset>.<table>": allowlist 外の参照があったので拒否
+    """
+    if referenced_tables is None:
+        # 取得できない場合は安全側で拒否したいならここで理由を返す。
+        # ただ、通常は None は例外時なので、ここは保守的に拒否。
+        return "REFERENCED_TABLES_UNAVAILABLE"
+
+    if len(referenced_tables) == 0:
+        # SELECT 1 などテーブル参照なしは許可
+        return None
+
+    # referenced_tables は 50 以上だと完全な一覧にならない可能性があるため安全側に倒す
+    if len(referenced_tables) >= 50:
+        return "TOO_MANY_REFERENCED_TABLES"
+
+    for t in referenced_tables:
+        p = t.get("projectId")
+        d = t.get("datasetId")
+        tb = t.get("tableId")
+        if p != ALLOW_PROJECT_ID or d != ALLOW_DATASET_ID:
+            return f"{p}.{d}.{tb}"
+    return None
+
+
+# ---------------------------
 # Result Types
 # ---------------------------
 
 class DryRunResult(TypedDict):
     ok: bool
     bytes_processed: Optional[int]
+    referenced_tables: Optional[List[Dict[str, str]]]
     reason: Optional[str]
     error_type: Optional[str]
     error_message: Optional[str]
@@ -213,7 +259,7 @@ class ExecuteResult(TypedDict):
 
 
 class PlanAndRunResult(TypedDict):
-    status: Literal["INVALID_SQL", "DRY_RUN_ERROR", "TOO_EXPENSIVE", "EXECUTION_ERROR", "SUCCESS"]
+    status: Literal["INVALID_SQL", "DRY_RUN_ERROR", "TOO_EXPENSIVE", "NOT_ALLOWED", "EXECUTION_ERROR", "SUCCESS"]
     sanitized_sql: Optional[str]
     dry_run_bytes: Optional[int]
     execute_result: Optional[ExecuteResult]
@@ -230,7 +276,6 @@ def dry_run_query(
     max_bytes: Optional[int] = None,
 ) -> DryRunResult:
     effective_project_id = _resolve_project_id(project_id)
-
     client = bigquery.Client(project=effective_project_id) if effective_project_id else bigquery.Client()
 
     job_config = bigquery.QueryJobConfig(
@@ -242,10 +287,17 @@ def dry_run_query(
         job = client.query(sql, job_config=job_config, location=BQ_LOCATION)
         bytes_processed = job.total_bytes_processed
 
+        # referenced tables を正規化して dict にする
+        refs: List[Dict[str, str]] = []
+        for r in (job.referenced_tables or []):
+            # TableReference: project / dataset_id / table_id
+            refs.append({"projectId": r.project, "datasetId": r.dataset_id, "tableId": r.table_id})
+
         if max_bytes is not None and bytes_processed is not None and bytes_processed > max_bytes:
             return DryRunResult(
                 ok=False,
                 bytes_processed=bytes_processed,
+                referenced_tables=refs,
                 reason="MAX_BYTES_EXCEEDED",
                 error_type=None,
                 error_message=None,
@@ -254,6 +306,7 @@ def dry_run_query(
         return DryRunResult(
             ok=True,
             bytes_processed=bytes_processed,
+            referenced_tables=refs,
             reason=None,
             error_type=None,
             error_message=None,
@@ -263,6 +316,7 @@ def dry_run_query(
         return DryRunResult(
             ok=False,
             bytes_processed=None,
+            referenced_tables=None,
             reason="BQ_ERROR",
             error_type=e.__class__.__name__,
             error_message=str(e),
@@ -276,7 +330,6 @@ def execute_query_with_max_bytes(
     preview_rows_limit: int = 50,
 ) -> ExecuteResult:
     effective_project_id = _resolve_project_id(project_id)
-
     client = bigquery.Client(project=effective_project_id) if effective_project_id else bigquery.Client()
 
     job_config = bigquery.QueryJobConfig()
@@ -328,8 +381,9 @@ def plan_and_run_query(
     """
     0) SQL バリデーション（非LLM）
     1) dry-run でコスト見積もり
-    2) max_dry_run_bytes 超過なら実行しない
-    3) 問題なければ maximum_bytes_billed 付きで本番実行
+    2) allowlist（参照テーブルが bigquery-public-data.ncaa_basketball のみ）チェック
+    3) max_dry_run_bytes 超過なら実行しない
+    4) 問題なければ maximum_bytes_billed 付きで本番実行
     """
     if not BQ_LOCATION:
         return PlanAndRunResult(
@@ -358,6 +412,7 @@ def plan_and_run_query(
         max_bytes=max_dry_run_bytes,
     )
 
+    # dry-run が allowlist 以前に落ちてるケース
     if not dry["ok"] and dry["reason"] == "MAX_BYTES_EXCEEDED":
         return PlanAndRunResult(
             status="TOO_EXPENSIVE",
@@ -377,6 +432,27 @@ def plan_and_run_query(
             dry_run_bytes=dry["bytes_processed"],
             execute_result=None,
             message=f"dry-run でエラー発生: {dry['error_type']} - {dry['error_message']}",
+        )
+
+    # ★ allowlist チェック（dry-run で得た参照テーブルに基づく）
+    violation = _validate_referenced_tables_allowlist(dry.get("referenced_tables"))
+    if violation is not None:
+        if violation == "TOO_MANY_REFERENCED_TABLES":
+            detail = "参照テーブル数が多すぎるため、安全に判定できず拒否しました。"
+        elif violation == "REFERENCED_TABLES_UNAVAILABLE":
+            detail = "参照テーブル情報を取得できないため、安全側で拒否しました。"
+        else:
+            detail = f"allowlist 外の参照を検出しました: {violation}"
+
+        return PlanAndRunResult(
+            status="NOT_ALLOWED",
+            sanitized_sql=sanitized_sql,
+            dry_run_bytes=dry["bytes_processed"],
+            execute_result=None,
+            message=(
+                "allowlist 違反のため拒否しました。"
+                f"許可: {ALLOW_PROJECT_ID}.{ALLOW_DATASET_ID} のみ。{detail}"
+            ),
         )
 
     exec_result = execute_query_with_max_bytes(
