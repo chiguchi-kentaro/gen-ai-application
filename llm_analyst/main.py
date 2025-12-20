@@ -1,29 +1,28 @@
-# main.py (Slack Gateway for Cloud Run)
-# - Receives Slack Events API (app_mention) at POST /slack/events
-# - Verifies Slack signature (Signing Secret)
-# - ACKs within 3 seconds, runs SQL via SQL Runner in BackgroundTasks
-# - Replies to Slack thread with result (or error)
+# main.py（Cloud Run 用 Slack Gateway）
+# - POST /slack/events で Slack Events API（app_mention）を受信
+# - Slack 署名を検証（Signing Secret）
+# - 3秒以内にACKし、重い処理は BackgroundTasks で実行
+# - 結果（またはエラー）を Slack のスレッドに返信
 #
-# Required env vars:
-#   SLACK_SIGNING_SECRET   : Slack App "Signing Secret"
-#   SLACK_BOT_TOKEN        : Slack Bot token (xoxb-...)
-#   SQL_RUNNER_URL         : e.g. https://llm-bq-api-xxxxxx-uc.a.run.app
+# 必須環境変数:
+#   SLACK_SIGNING_SECRET   : Slack App の「Signing Secret」
+#   SLACK_BOT_TOKEN        : Slack Bot トークン（xoxb-...）
 #
-# Optional env vars:
-#   SQL_RUNNER_AUDIENCE    : usually same as SQL_RUNNER_URL (base URL)
-#     - If omitted, SQL_RUNNER_URL will be used.
+# BigQuery 関連環境変数:
+#   BQ_LOCATION            : 例 "asia-northeast1" / "US"
+#   DATA_PROJECT_ID        : 任意、GOOGLE_CLOUD_PROJECT を上書き
+#   GOOGLE_CLOUD_PROJECT   : DATA_PROJECT_ID が空のときのフォールバック
 #
-# Notes:
-# - This version DOES NOT use service-account impersonation.
-# - If SQL Runner is private (--no-allow-unauthenticated), it must grant roles/run.invoker
-#   to THIS gateway's runtime service account.
+# 任意環境変数:
+#   MAX_DRY_RUN_BYTES      : int、デフォルト 5 * 1024**2
+#   MAXIMUM_BYTES_BILLED   : int、デフォルト 10 * 1024**2
 #
-# Run locally:
+# ローカル起動:
 #   uvicorn main:app --host 0.0.0.0 --port 8080
 
 from __future__ import annotations
 
-import base64
+import asyncio
 import hashlib
 import hmac
 import json
@@ -31,11 +30,14 @@ import logging
 import os
 import re
 import time
+import uuid
 from typing import Any, Dict
 
 import httpx
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
+
+from bq_tools import plan_and_run_query
 
 app = FastAPI()
 
@@ -44,14 +46,35 @@ logger.setLevel(logging.INFO)
 
 
 # ----------------------------
-# Env helpers
+# 環境変数ヘルパー
 # ----------------------------
 def _env(key: str, default: str = "") -> str:
     return os.getenv(key, default)
 
 
+def _env_int(key: str, default: int) -> int:
+    raw = _env(key, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("invalid_int_env key=%s value=%r", key, raw)
+        return default
+
+
+def _resolve_project_id() -> str | None:
+    data_project = _env("DATA_PROJECT_ID", "")
+    default_project = _env("GOOGLE_CLOUD_PROJECT", "")
+    return data_project or default_project or None
+
+
+def _log_json(payload: Dict[str, Any]) -> None:
+    print(json.dumps(payload, ensure_ascii=False))
+
+
 # ----------------------------
-# Slack signature verification
+# Slack 署名検証
 # ----------------------------
 def _verify_slack_signature(request: Request, body: bytes) -> None:
     secret = _env("SLACK_SIGNING_SECRET", "")
@@ -94,7 +117,7 @@ def _verify_slack_signature(request: Request, body: bytes) -> None:
 
 
 # ----------------------------
-# Slack message helpers
+# Slack メッセージ送信ヘルパー
 # ----------------------------
 async def _slack_api_post(method: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     token = _env("SLACK_BOT_TOKEN", "")
@@ -109,7 +132,7 @@ async def _slack_api_post(method: str, payload: Dict[str, Any]) -> Dict[str, Any
             json=payload,
         )
 
-    # HTTP error (rare; Slack usually returns 200 with ok:false)
+    # HTTPエラー（稀。Slackは通常200で ok:false を返す）
     try:
         r.raise_for_status()
     except Exception:
@@ -121,7 +144,7 @@ async def _slack_api_post(method: str, payload: Dict[str, Any]) -> Dict[str, Any
         )
         raise
 
-    # Slack API-level error
+    # Slack API レベルのエラー
     try:
         data = r.json()
     except Exception:
@@ -153,144 +176,115 @@ async def _post_ephemeral(channel: str, user: str, text: str) -> None:
 
 
 # ----------------------------
-# SQL extraction
+# SQL 抽出
 # ----------------------------
 def _extract_sql_from_app_mention(text: str) -> str:
-    # Remove leading "<@UXXXX>" mention token
+    # 先頭の "<@UXXXX>" メンションを除去
     t = (text or "").strip()
     t = re.sub(r"^<@[^>]+>\s*", "", t).strip()
     return t
 
 
 # ----------------------------
-# ID token minting (Cloud Run → Cloud Run)
-# ----------------------------
-def _jwt_payload(token: str) -> Dict[str, Any]:
-    # For logging/debug only. Do NOT log the token itself.
-    try:
-        parts = token.split(".")
-        if len(parts) < 2:
-            return {}
-        payload_b64 = parts[1] + "=" * (-len(parts[1]) % 4)
-        raw = base64.urlsafe_b64decode(payload_b64.encode("utf-8"))
-        return json.loads(raw.decode("utf-8"))
-    except Exception:
-        return {}
-
-
-def _get_id_token_google_auth(audience: str) -> str:
-    """
-    Returns an ID token for Cloud Run service-to-service auth (NO impersonation).
-    Uses runtime ADC (the Cloud Run service account identity).
-    """
-    import google.oauth2.id_token
-    from google.auth.transport.requests import Request as GARequest
-
-    req = GARequest()
-    return google.oauth2.id_token.fetch_id_token(req, audience)
-
-
-# ----------------------------
-# SQL Runner call + reply
+# SQL 実行 + 返信
 # ----------------------------
 async def _run_sql_and_reply(channel: str, user: str, thread_ts: str, sql: str) -> None:
-    sql_runner_url = _env("SQL_RUNNER_URL", "").rstrip("/")
-    if not sql_runner_url:
-        await _post_ephemeral(channel, user, "SQL_RUNNER_URL not set")
-        return
+    run_id = uuid.uuid4().hex
+    start = time.time()
 
-    audience = (_env("SQL_RUNNER_AUDIENCE", "") or sql_runner_url).rstrip("/")
-    token = _get_id_token_google_auth(audience=audience)
-
-    # Debug: who is the caller principal? (useful for 403 run.invoker issues)
-    p = _jwt_payload(token)
-    logger.info(
-        "runner_token_subject email=%s sub=%s aud=%s iss=%s",
-        p.get("email"),
-        p.get("sub"),
-        p.get("aud"),
-        p.get("iss"),
-    )
-
-    url = f"{sql_runner_url}/run-sql"
-    payload = {"sql": sql}
-
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        r = await client.post(
-            url,
-            headers={"Authorization": f"Bearer {token}"},
-            json=payload,
-        )
-
-    ct = r.headers.get("content-type", "")
-    body_prefix = r.text[:500]
-
-    logger.info(
-        "sql_runner_response status=%d content_type=%s body_prefix=%r url=%s",
-        r.status_code,
-        ct,
-        body_prefix[:200],
-        url,
-    )
-
-    # Cloud Run errors often come back as HTML; do not try to JSON-decode blindly.
-    if r.status_code != 200:
+    project_id = _resolve_project_id()
+    if not project_id:
         await _post_message(
             channel,
-            f"SQL Runner error: status={r.status_code}, content-type={ct}\n```{body_prefix[:200]}```",
+            "DATA_PROJECT_ID / GOOGLE_CLOUD_PROJECT not set",
             thread_ts=thread_ts,
         )
+        _log_json({
+            "event": "run_sql",
+            "run_id": run_id,
+            "status": "CONFIG_ERROR",
+            "message": "DATA_PROJECT_ID / GOOGLE_CLOUD_PROJECT not set",
+            "slack_channel": channel,
+            "slack_user": user,
+        })
         return
 
-    if "application/json" not in ct:
-        await _post_message(
-            channel,
-            f"SQL Runner non-JSON response: content-type={ct}\n```{body_prefix[:200]}```",
-            thread_ts=thread_ts,
-        )
-        return
+    max_dry = _env_int("MAX_DRY_RUN_BYTES", 5 * 1024**2)
+    max_bill = _env_int("MAXIMUM_BYTES_BILLED", 10 * 1024**2)
 
     try:
-        data = r.json()
+        result = await asyncio.to_thread(
+            plan_and_run_query,
+            sql=sql,
+            project_id=project_id,
+            max_dry_run_bytes=max_dry,
+            maximum_bytes_billed=max_bill,
+        )
     except Exception as e:
         await _post_message(
             channel,
-            f"SQL Runner JSON decode failed: {type(e).__name__}: {e}\n```{body_prefix[:200]}```",
+            f"SQL Runner error: {type(e).__name__}: {e}",
             thread_ts=thread_ts,
         )
+        _log_json({
+            "event": "run_sql",
+            "run_id": run_id,
+            "status": "UNHANDLED_ERROR",
+            "error_type": type(e).__name__,
+            "error_message": str(e),
+            "slack_channel": channel,
+            "slack_user": user,
+        })
         return
 
-    # Pretty-print response for Slack
+    elapsed_ms = int((time.time() - start) * 1000)
+    result["run_id"] = run_id
+    result["elapsed_ms"] = elapsed_ms
+
+    exec_result = result.get("execute_result") or {}
+    _log_json({
+        "event": "run_sql",
+        "run_id": run_id,
+        "status": result.get("status"),
+        "elapsed_ms": elapsed_ms,
+        "dry_run_bytes": result.get("dry_run_bytes"),
+        "job_id": exec_result.get("job_id"),
+        "bytes_processed": exec_result.get("bytes_processed"),
+        "num_rows": exec_result.get("num_rows"),
+        "slack_channel": channel,
+        "slack_user": user,
+    })
+
     await _post_message(
         channel,
-        f"run result:\n```{json.dumps(data, ensure_ascii=False, indent=2)}```",
+        f"run result:\n```{json.dumps(result, ensure_ascii=False, indent=2)}```",
         thread_ts=thread_ts,
     )
 
 
 # ----------------------------
-# Slack Events endpoint
+# Slack Events エンドポイント
 # ----------------------------
 @app.post("/slack/events")
 async def slack_events(req: Request, bg: BackgroundTasks):
     """
-    Slack Events API receiver.
-    - Must ACK within 3 seconds; heavy work is background.
+    Slack Events API の受信。
+    - 3秒以内にACKし、重い処理はバックグラウンドで実行
     """
     body = await req.body()
     _verify_slack_signature(req, body)
 
-    # Parse JSON safely from raw bytes
+    # raw bytes から安全に JSON をパース
     try:
         payload = json.loads(body.decode("utf-8"))
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON payload")
 
-    # URL Verification: return challenge
+    # URL Verification: challenge を返す
     if payload.get("type") == "url_verification":
         return JSONResponse({"challenge": payload.get("challenge", "")})
 
-    # Slack retries: ACK only (avoid duplicate execution)
+    # Slack の再送: ACK のみ返す（重複実行を回避）
     if req.headers.get("x-slack-retry-num"):
         return JSONResponse({"ok": True})
 
@@ -299,7 +293,7 @@ async def slack_events(req: Request, bg: BackgroundTasks):
 
     event = payload.get("event") or {}
 
-    # Loop prevention
+    # ループ防止
     if event.get("bot_id") or event.get("subtype") == "bot_message":
         return JSONResponse({"ok": True})
 
@@ -316,7 +310,9 @@ async def slack_events(req: Request, bg: BackgroundTasks):
         bg.add_task(_post_ephemeral, channel, user, "Usage: @bot <SQL>")
         return JSONResponse({"ok": True})
 
-    # Run background job
+    await _post_ephemeral(channel, user, "受け付けました。実行を開始します。")
+
+    # バックグラウンドで実行
     bg.add_task(_run_sql_and_reply, channel, user, thread_ts, sql)
     return JSONResponse({"ok": True})
 
