@@ -8,6 +8,9 @@ from typing import Literal, Optional, List, Dict, Any
 from typing_extensions import TypedDict  # ★ 重要: typing.TypedDict ではなくこちら
 from google.cloud import bigquery
 from google.api_core import exceptions as gcloud_exceptions
+import google.auth
+from google.auth.transport.requests import Request
+import httpx
 
 
 # ---------------------------
@@ -17,6 +20,17 @@ from google.api_core import exceptions as gcloud_exceptions
 DATA_PROJECT_ID = os.getenv("DATA_PROJECT_ID")
 GCP_DEFAULT_PROJECT = os.getenv("GOOGLE_CLOUD_PROJECT")
 BQ_LOCATION = os.getenv("BQ_LOCATION")  # 例: "asia-northeast1" / "US"
+VERTEX_LOCATION = os.getenv("VERTEX_LOCATION", "")
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "gemini-embedding-001")
+EMBEDDING_META_TABLE = os.getenv(
+    "EMBEDDING_META_TABLE",
+    "kentaro-388002.meta.embedding_meta_data",
+)
+EMBEDDING_COLUMN = os.getenv("EMBEDDING_COLUMN", "embedding_document")
+try:
+    EMBEDDING_TOP_K = int(os.getenv("EMBEDDING_TOP_K", "8"))
+except ValueError:
+    EMBEDDING_TOP_K = 8
 
 # ---------------------------
 # Allowlist (hard-coded for now)
@@ -36,6 +50,172 @@ def _resolve_project_id(explicit_project_id: Optional[str]) -> Optional[str]:
     if GCP_DEFAULT_PROJECT:
         return GCP_DEFAULT_PROJECT
     return None
+
+
+def _resolve_vertex_location() -> Optional[str]:
+    if VERTEX_LOCATION:
+        return VERTEX_LOCATION
+    if BQ_LOCATION and BQ_LOCATION.lower() not in {"us", "eu"}:
+        return BQ_LOCATION
+    return None
+
+
+def _strip_embedding_fields(row: Dict[str, Any]) -> Dict[str, Any]:
+    cleaned: Dict[str, Any] = {}
+    for key, value in row.items():
+        if isinstance(value, list) and value and all(isinstance(v, (int, float)) for v in value):
+            continue
+        cleaned[key] = value
+    return cleaned
+
+
+def _extract_table_column(row: Dict[str, Any]) -> Optional[Dict[str, str]]:
+    table = (
+        row.get("table_name")
+        or row.get("table")
+        or row.get("table_id")
+    )
+    column = (
+        row.get("column_name")
+        or row.get("column")
+        or row.get("column_id")
+    )
+    table_description = (
+        row.get("table_description")
+    )
+    column_description = (
+        row.get("column_description")
+    )
+
+
+    if not table:
+        project = row.get("project") or row.get("project_id")
+        dataset = row.get("dataset") or row.get("dataset_id")
+        table_id = row.get("tableId") or row.get("table_id")
+        if project and dataset and table_id:
+            table = f"{project}.{dataset}.{table_id}"
+        elif dataset and table_id:
+            table = f"{dataset}.{table_id}"
+
+    if not table and not column:
+        return None
+
+    result: Dict[str, str] = {}
+    if table:
+        result["table_name"] = str(table)
+    if column:
+        result["column_name"] = str(column)
+    if table_description:
+        result["table_description"] = str(table_description)
+    if column_description:
+        result["column_description"] = str(column_description)
+    return result
+
+
+def generate_text_embedding(
+    text: str,
+    *,
+    project_id: str,
+    model: Optional[str] = None,
+    location: Optional[str] = None,
+) -> List[float]:
+    if not text:
+        raise ValueError("text is empty")
+
+    resolved_location = location or _resolve_vertex_location()
+    if not resolved_location:
+        raise RuntimeError("VERTEX_LOCATION is not set (and BQ_LOCATION is not a region)")
+
+    model_name = model or EMBEDDING_MODEL
+    if not model_name:
+        raise RuntimeError("EMBEDDING_MODEL is not set")
+
+    credentials, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
+    credentials.refresh(Request())
+    if not credentials.token:
+        raise RuntimeError("failed to obtain access token for Vertex AI")
+
+    url = (
+        f"https://{resolved_location}-aiplatform.googleapis.com/v1/projects/"
+        f"{project_id}/locations/{resolved_location}/publishers/google/models/"
+        f"{model_name}:predict"
+    )
+    payload = {"instances": [{"content": text}]}
+    headers = {"Authorization": f"Bearer {credentials.token}"}
+
+    with httpx.Client(timeout=20.0) as client:
+        resp = client.post(url, json=payload, headers=headers)
+        try:
+            resp.raise_for_status()
+        except Exception as exc:
+            raise RuntimeError(f"Vertex AI error: {resp.status_code} {resp.text[:300]}") from exc
+
+    data = resp.json()
+    predictions = data.get("predictions") or []
+    if not predictions:
+        raise RuntimeError("Vertex AI response missing predictions")
+
+    first = predictions[0] or {}
+    embeddings = first.get("embeddings") or first.get("embedding") or first
+    values = embeddings.get("values") if isinstance(embeddings, dict) else None
+    if not values or not isinstance(values, list):
+        raise RuntimeError("Vertex AI response missing embedding values")
+    return values
+
+
+def search_embedding_meta_data(
+    text: str,
+    *,
+    project_id: Optional[str] = None,
+    top_k: Optional[int] = None,
+) -> Dict[str, Any]:
+    effective_project_id = _resolve_project_id(project_id)
+    if not effective_project_id:
+        raise RuntimeError("DATA_PROJECT_ID / GOOGLE_CLOUD_PROJECT not set")
+
+    query_embedding = generate_text_embedding(text, project_id=effective_project_id)
+    client = bigquery.Client(project=effective_project_id)
+
+    resolved_top_k = top_k or EMBEDDING_TOP_K
+    sql = f"""
+    SELECT
+      base.table_name,
+      base.column_name,
+      base.table_description,
+      base.column_description,
+      base.data_type,
+      distance
+    FROM VECTOR_SEARCH(
+      TABLE `{EMBEDDING_META_TABLE}`,
+      '{EMBEDDING_COLUMN}',
+      (SELECT @query_embedding AS {EMBEDDING_COLUMN}),
+      top_k => @top_k,
+      distance_type => 'COSINE'
+    )
+    """
+
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ArrayQueryParameter("query_embedding", "FLOAT64", query_embedding),
+            bigquery.ScalarQueryParameter("top_k", "INT64", resolved_top_k),
+        ]
+    )
+
+    job = client.query(sql, job_config=job_config, location=BQ_LOCATION)
+    rows = [dict(row) for row in job.result()]
+
+    cleaned_rows = [_strip_embedding_fields(r) for r in rows]
+    extracted_items = []
+    for row in cleaned_rows:
+        item = _extract_table_column(row)
+        if item:
+            extracted_items.append(item)
+    return {
+        "status": "SUCCESS",
+        "top_k": resolved_top_k,
+        "table": EMBEDDING_META_TABLE,
+        "items": extracted_items,
+    }
 
 
 # ---------------------------

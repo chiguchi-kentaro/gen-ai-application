@@ -8,14 +8,15 @@
 #   SLACK_SIGNING_SECRET   : Slack App の「Signing Secret」
 #   SLACK_BOT_TOKEN        : Slack Bot トークン（xoxb-...）
 #
-# BigQuery 関連環境変数:
+# BigQuery / Vertex AI 関連環境変数:
 #   BQ_LOCATION            : 例 "asia-northeast1" / "US"
 #   DATA_PROJECT_ID        : 任意、GOOGLE_CLOUD_PROJECT を上書き
 #   GOOGLE_CLOUD_PROJECT   : DATA_PROJECT_ID が空のときのフォールバック
-#
-# 任意環境変数:
-#   MAX_DRY_RUN_BYTES      : int、デフォルト 5 * 1024**2
-#   MAXIMUM_BYTES_BILLED   : int、デフォルト 10 * 1024**2
+#   VERTEX_LOCATION        : Vertex AI のリージョン（例: asia-northeast1）
+#   EMBEDDING_MODEL        : 例 "text-embedding-005"
+#   EMBEDDING_META_TABLE   : 例 "kentaro-388002.meta.embedding_meta_data"
+#   EMBEDDING_COLUMN       : 例 "embedding"
+#   EMBEDDING_TOP_K        : int、デフォルト 8
 #
 # ローカル起動:
 #   uvicorn main:app --host 0.0.0.0 --port 8080
@@ -37,7 +38,7 @@ import httpx
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
-from bq_tools import plan_and_run_query
+from bq_tools import search_embedding_meta_data
 
 app = FastAPI()
 
@@ -51,16 +52,6 @@ logger.setLevel(logging.INFO)
 def _env(key: str, default: str = "") -> str:
     return os.getenv(key, default)
 
-
-def _env_int(key: str, default: int) -> int:
-    raw = _env(key, "").strip()
-    if not raw:
-        return default
-    try:
-        return int(raw)
-    except ValueError:
-        logger.warning("invalid_int_env key=%s value=%r", key, raw)
-        return default
 
 
 def _resolve_project_id() -> str | None:
@@ -176,9 +167,9 @@ async def _post_ephemeral(channel: str, user: str, text: str) -> None:
 
 
 # ----------------------------
-# SQL 抽出
+# クエリ抽出
 # ----------------------------
-def _extract_sql_from_app_mention(text: str) -> str:
+def _extract_query_from_app_mention(text: str) -> str:
     # 先頭の "<@UXXXX>" メンションを除去
     t = (text or "").strip()
     t = re.sub(r"^<@[^>]+>\s*", "", t).strip()
@@ -186,9 +177,14 @@ def _extract_sql_from_app_mention(text: str) -> str:
 
 
 # ----------------------------
-# SQL 実行 + 返信
+# 関連メタデータ検索 + 返信
 # ----------------------------
-async def _run_sql_and_reply(channel: str, user: str, thread_ts: str, sql: str) -> None:
+async def _run_semantic_search_and_reply(
+    channel: str,
+    user: str,
+    thread_ts: str,
+    query: str,
+) -> None:
     run_id = uuid.uuid4().hex
     start = time.time()
 
@@ -200,7 +196,7 @@ async def _run_sql_and_reply(channel: str, user: str, thread_ts: str, sql: str) 
             thread_ts=thread_ts,
         )
         _log_json({
-            "event": "run_sql",
+            "event": "semantic_search",
             "run_id": run_id,
             "status": "CONFIG_ERROR",
             "message": "DATA_PROJECT_ID / GOOGLE_CLOUD_PROJECT not set",
@@ -209,25 +205,20 @@ async def _run_sql_and_reply(channel: str, user: str, thread_ts: str, sql: str) 
         })
         return
 
-    max_dry = _env_int("MAX_DRY_RUN_BYTES", 5 * 1024**2)
-    max_bill = _env_int("MAXIMUM_BYTES_BILLED", 10 * 1024**2)
-
     try:
         result = await asyncio.to_thread(
-            plan_and_run_query,
-            sql=sql,
+            search_embedding_meta_data,
+            text=query,
             project_id=project_id,
-            max_dry_run_bytes=max_dry,
-            maximum_bytes_billed=max_bill,
         )
     except Exception as e:
         await _post_message(
             channel,
-            f"SQL Runner error: {type(e).__name__}: {e}",
+            f"Semantic search error: {type(e).__name__}: {e}",
             thread_ts=thread_ts,
         )
         _log_json({
-            "event": "run_sql",
+            "event": "semantic_search",
             "run_id": run_id,
             "status": "UNHANDLED_ERROR",
             "error_type": type(e).__name__,
@@ -241,23 +232,18 @@ async def _run_sql_and_reply(channel: str, user: str, thread_ts: str, sql: str) 
     result["run_id"] = run_id
     result["elapsed_ms"] = elapsed_ms
 
-    exec_result = result.get("execute_result") or {}
     _log_json({
-        "event": "run_sql",
+        "event": "semantic_search",
         "run_id": run_id,
         "status": result.get("status"),
         "elapsed_ms": elapsed_ms,
-        "dry_run_bytes": result.get("dry_run_bytes"),
-        "job_id": exec_result.get("job_id"),
-        "bytes_processed": exec_result.get("bytes_processed"),
-        "num_rows": exec_result.get("num_rows"),
         "slack_channel": channel,
         "slack_user": user,
     })
 
     await _post_message(
         channel,
-        f"run result:\n```{json.dumps(result, ensure_ascii=False, indent=2)}```",
+        f"related tables/columns:\n```{json.dumps(result, ensure_ascii=False, indent=2)}```",
         thread_ts=thread_ts,
     )
 
@@ -305,15 +291,15 @@ async def slack_events(req: Request, bg: BackgroundTasks):
     text = str(event.get("text") or "")
     thread_ts = str(event.get("thread_ts") or event.get("ts") or "")
 
-    sql = _extract_sql_from_app_mention(text)
-    if not sql:
-        bg.add_task(_post_ephemeral, channel, user, "Usage: @bot <SQL>")
+    query = _extract_query_from_app_mention(text)
+    if not query:
+        bg.add_task(_post_ephemeral, channel, user, "Usage: @bot <自然言語クエリ>")
         return JSONResponse({"ok": True})
 
-    await _post_ephemeral(channel, user, "受け付けました。実行を開始します。")
+    await _post_ephemeral(channel, user, "受け付けました。検索を開始します。")
 
     # バックグラウンドで実行
-    bg.add_task(_run_sql_and_reply, channel, user, thread_ts, sql)
+    bg.add_task(_run_semantic_search_and_reply, channel, user, thread_ts, query)
     return JSONResponse({"ok": True})
 
 
