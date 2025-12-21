@@ -10,8 +10,8 @@
 #
 # BigQuery / Vertex AI 関連環境変数:
 #   BQ_LOCATION            : 例 "asia-northeast1" / "US"
-#   DATA_PROJECT_ID        : 任意、GOOGLE_CLOUD_PROJECT を上書き
-#   GOOGLE_CLOUD_PROJECT   : DATA_PROJECT_ID が空のときのフォールバック
+#   PROJECT_ID             : 任意、GOOGLE_CLOUD_PROJECT を上書き
+#   GOOGLE_CLOUD_PROJECT   : PROJECT_ID が空のときのフォールバック
 #   VERTEX_LOCATION        : Vertex AI のリージョン（例: asia-northeast1）
 #   EMBEDDING_MODEL        : 例 "text-embedding-005"
 #   EMBEDDING_META_TABLE   : 例 "kentaro-388002.meta.embedding_meta_data"
@@ -39,6 +39,7 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from bq_tools import search_embedding_meta_data
+from llm import generate_sql_from_search
 
 app = FastAPI()
 
@@ -55,7 +56,7 @@ def _env(key: str, default: str = "") -> str:
 
 
 def _resolve_project_id() -> str | None:
-    data_project = _env("DATA_PROJECT_ID", "")
+    data_project = _env("PROJECT_ID", "")
     default_project = _env("GOOGLE_CLOUD_PROJECT", "")
     return data_project or default_project or None
 
@@ -179,7 +180,7 @@ def _extract_query_from_app_mention(text: str) -> str:
 # ----------------------------
 # 関連メタデータ検索 + 返信
 # ----------------------------
-async def _run_semantic_search_and_reply(
+async def _run_semantic_search_and_generate_sql(
     channel: str,
     user: str,
     thread_ts: str,
@@ -192,14 +193,14 @@ async def _run_semantic_search_and_reply(
     if not project_id:
         await _post_message(
             channel,
-            "DATA_PROJECT_ID / GOOGLE_CLOUD_PROJECT not set",
+            "PROJECT_ID / GOOGLE_CLOUD_PROJECT not set",
             thread_ts=thread_ts,
         )
         _log_json({
             "event": "semantic_search",
             "run_id": run_id,
             "status": "CONFIG_ERROR",
-            "message": "DATA_PROJECT_ID / GOOGLE_CLOUD_PROJECT not set",
+            "message": "PROJECT_ID / GOOGLE_CLOUD_PROJECT not set",
             "slack_channel": channel,
             "slack_user": user,
         })
@@ -228,14 +229,35 @@ async def _run_semantic_search_and_reply(
         })
         return
 
-    elapsed_ms = int((time.time() - start) * 1000)
-    result["run_id"] = run_id
-    result["elapsed_ms"] = elapsed_ms
+    try:
+        sql = await asyncio.to_thread(
+            generate_sql_from_search,
+            query,
+            result,
+            project_id=project_id,
+        )
+    except Exception as e:
+        await _post_message(
+            channel,
+            f"SQL generation error: {type(e).__name__}: {e}",
+            thread_ts=thread_ts,
+        )
+        _log_json({
+            "event": "sql_generation",
+            "run_id": run_id,
+            "status": "UNHANDLED_ERROR",
+            "error_type": type(e).__name__,
+            "error_message": str(e),
+            "slack_channel": channel,
+            "slack_user": user,
+        })
+        return
 
+    elapsed_ms = int((time.time() - start) * 1000)
     _log_json({
-        "event": "semantic_search",
+        "event": "sql_generation",
         "run_id": run_id,
-        "status": result.get("status"),
+        "status": "SUCCESS",
         "elapsed_ms": elapsed_ms,
         "slack_channel": channel,
         "slack_user": user,
@@ -243,7 +265,7 @@ async def _run_semantic_search_and_reply(
 
     await _post_message(
         channel,
-        f"related tables/columns:\n```{json.dumps(result, ensure_ascii=False, indent=2)}```",
+        f"generated SQL:\n```sql\n{sql}\n```",
         thread_ts=thread_ts,
     )
 
@@ -299,7 +321,7 @@ async def slack_events(req: Request, bg: BackgroundTasks):
     await _post_ephemeral(channel, user, "受け付けました。検索を開始します。")
 
     # バックグラウンドで実行
-    bg.add_task(_run_semantic_search_and_reply, channel, user, thread_ts, query)
+    bg.add_task(_run_semantic_search_and_generate_sql, channel, user, thread_ts, query)
     return JSONResponse({"ok": True})
 
 

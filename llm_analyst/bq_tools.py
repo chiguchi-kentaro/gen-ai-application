@@ -17,7 +17,7 @@ import httpx
 # Env
 # ---------------------------
 
-DATA_PROJECT_ID = os.getenv("DATA_PROJECT_ID")
+PROJECT_ID = os.getenv("PROJECT_ID")
 GCP_DEFAULT_PROJECT = os.getenv("GOOGLE_CLOUD_PROJECT")
 BQ_LOCATION = os.getenv("BQ_LOCATION")  # 例: "asia-northeast1" / "US"
 VERTEX_LOCATION = os.getenv("VERTEX_LOCATION", "")
@@ -45,8 +45,8 @@ ALLOW_DATASET_ID = "ncaa_basketball"
 def _resolve_project_id(explicit_project_id: Optional[str]) -> Optional[str]:
     if explicit_project_id:
         return explicit_project_id
-    if DATA_PROJECT_ID:
-        return DATA_PROJECT_ID
+    if PROJECT_ID:
+        return PROJECT_ID
     if GCP_DEFAULT_PROJECT:
         return GCP_DEFAULT_PROJECT
     return None
@@ -171,7 +171,7 @@ def search_embedding_meta_data(
 ) -> Dict[str, Any]:
     effective_project_id = _resolve_project_id(project_id)
     if not effective_project_id:
-        raise RuntimeError("DATA_PROJECT_ID / GOOGLE_CLOUD_PROJECT not set")
+        raise RuntimeError("PROJECT_ID / GOOGLE_CLOUD_PROJECT not set")
 
     query_embedding = generate_text_embedding(text, project_id=effective_project_id)
     client = bigquery.Client(project=effective_project_id)
@@ -231,11 +231,11 @@ class SqlValidationResult:
 
 FORBIDDEN_KEYWORDS = {
     # DDL
-    "create", "alter", "drop", "truncate", "replace",
+    "create", "alter", "drop", "truncate", "create or replace",
     # DML
     "insert", "update", "delete", "merge",
     # BigQuery scripting / dynamic SQL
-    "declare", "begin", "end", "execute", "immediate",
+    "declare", "begin", "execute", "immediate",
     # permissions / exports / procedures（必要なら調整）
     "grant", "revoke", "export", "load", "copy", "call",
 }
