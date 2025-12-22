@@ -29,7 +29,7 @@ def _load_system_prompt() -> str:
         os.path.dirname(__file__),
         "..",
         "prompts",
-        "sql_generator_system_prompt.md",
+        "extract_keyword.md",
     )
     with open(prompt_path, "r", encoding="utf-8") as f:
         return f.read()
@@ -46,36 +46,14 @@ def _extract_json(text: str) -> str:
     return text
 
 
-def _extract_sql(text: str) -> str:
-    json_text = _extract_json(text)
-    try:
-        payload = json.loads(json_text)
-    except Exception:
-        payload = None
-
-    if isinstance(payload, dict) and isinstance(payload.get("sql"), str):
-        return payload["sql"].strip()
-
-    sql_block = re.search(r"```sql\s*(.*?)```", text, re.DOTALL | re.IGNORECASE)
-    if sql_block:
-        return sql_block.group(1).strip()
-
-    return text.strip()
-
-
-def _generate_content(
-    *,
-    system_prompt: str,
-    user_prompt: str,
-    project_id: str,
-) -> str:
+def _generate_content(*, system_prompt: str, user_prompt: str, project_id: str) -> str:
     location = _resolve_vertex_location()
     if not location:
         raise RuntimeError("VERTEX_LOCATION is not set (and BQ_LOCATION is not a region)")
 
-    model = _env("LLM_MODEL", "gemini-2.0-flash-lite")
-    temperature = float(_env("LLM_TEMPERATURE", "0.8"))
-    max_tokens = int(_env("LLM_MAX_OUTPUT_TOKENS", "1024"))
+    model = _env("KEYWORD_MODEL", _env("LLM_MODEL", "gemini-2.0-flash-lite"))
+    temperature = float(_env("KEYWORD_TEMPERATURE", "0"))
+    max_tokens = int(_env("KEYWORD_MAX_OUTPUT_TOKENS", "50"))
 
     credentials, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
     credentials.refresh(Request())
@@ -129,47 +107,29 @@ def _generate_content(
     return text
 
 
-def _dedupe_items(items: list[Dict[str, Any]]) -> list[Dict[str, Any]]:
-    seen = set()
-    deduped = []
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        key = (item.get("table_name"), item.get("column_name"))
-        if key in seen:
-            continue
-        seen.add(key)
-        deduped.append(item)
-    return deduped
+def _normalize_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(v) for v in value if isinstance(v, (str, int, float))]
+    return []
 
 
-def generate_sql_from_search(
-    query: str,
-    search_results: list[Dict[str, Any]],
-    *,
-    project_id: str,
-) -> str:
+def extract_keywords(user_request: str, *, project_id: str) -> Dict[str, Any]:
     system_prompt = _load_system_prompt()
-    all_items: list[Dict[str, Any]] = []
-    for entry in search_results:
-        if isinstance(entry, dict):
-            items = entry.get("items", [])
-            if isinstance(items, list):
-                all_items.extend(items)
-    deduped_items = _dedupe_items(all_items)
-
-    user_payload = {
-        "user_request": query,
-        "semantic_search_items": deduped_items,
-        "semantic_search_by_keyword": search_results,
-    }
-    user_prompt = json.dumps(user_payload, ensure_ascii=False, indent=2)
+    user_prompt = user_request.strip()
     response_text = _generate_content(
         system_prompt=system_prompt,
         user_prompt=user_prompt,
         project_id=project_id,
     )
-    sql = _extract_sql(response_text)
-    if not sql:
-        raise RuntimeError("LLM returned empty SQL")
-    return sql
+    json_text = _extract_json(response_text)
+    try:
+        payload = json.loads(json_text)
+    except Exception:
+        payload = {}
+
+    return {
+        "metrics": _normalize_list(payload.get("metrics")),
+        "dimensions": _normalize_list(payload.get("dimensions")),
+        "filters": payload.get("filters") if isinstance(payload.get("filters"), list) else [],
+        "raw": payload,
+    }

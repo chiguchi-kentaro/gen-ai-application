@@ -39,7 +39,7 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from bq_tools import search_embedding_meta_data
-from llm import generate_sql_from_search
+from llm import extract_keywords, generate_sql_from_search
 
 app = FastAPI()
 
@@ -207,19 +207,19 @@ async def _run_semantic_search_and_generate_sql(
         return
 
     try:
-        result = await asyncio.to_thread(
-            search_embedding_meta_data,
-            text=query,
+        keyword_payload = await asyncio.to_thread(
+            extract_keywords,
+            query,
             project_id=project_id,
         )
     except Exception as e:
         await _post_message(
             channel,
-            f"Semantic search error: {type(e).__name__}: {e}",
+            f"Keyword extraction error: {type(e).__name__}: {e}",
             thread_ts=thread_ts,
         )
         _log_json({
-            "event": "semantic_search",
+            "event": "keyword_extraction",
             "run_id": run_id,
             "status": "UNHANDLED_ERROR",
             "error_type": type(e).__name__,
@@ -229,11 +229,66 @@ async def _run_semantic_search_and_generate_sql(
         })
         return
 
+    keywords: list[str] = []
+    for key in ("metrics", "dimensions"):
+        values = keyword_payload.get(key)
+        if isinstance(values, list):
+            keywords.extend([str(v) for v in values if v])
+    filters = keyword_payload.get("filters")
+    if isinstance(filters, list):
+        for entry in filters:
+            if isinstance(entry, dict):
+                for field in ("field", "value"):
+                    value = entry.get(field)
+                    if value:
+                        keywords.append(str(value))
+            elif isinstance(entry, str):
+                keywords.append(entry)
+
+    deduped_keywords = []
+    seen_keywords = set()
+    for kw in keywords:
+        if kw in seen_keywords:
+            continue
+        seen_keywords.add(kw)
+        deduped_keywords.append(kw)
+
+    if not deduped_keywords:
+        deduped_keywords = [query]
+
+    search_results = []
+    for kw in deduped_keywords:
+        try:
+            result = await asyncio.to_thread(
+                search_embedding_meta_data,
+                text=kw,
+                project_id=project_id,
+                top_k=3,
+            )
+        except Exception as e:
+            await _post_message(
+                channel,
+                f"Semantic search error: {type(e).__name__}: {e}",
+                thread_ts=thread_ts,
+            )
+            _log_json({
+                "event": "semantic_search",
+                "run_id": run_id,
+                "status": "UNHANDLED_ERROR",
+                "error_type": type(e).__name__,
+                "error_message": str(e),
+                "slack_channel": channel,
+                "slack_user": user,
+            })
+            return
+        result["keyword"] = kw
+        search_results.append(result)
+
     try:
         sql = await asyncio.to_thread(
             generate_sql_from_search,
             query,
-            result,
+            search_results,
             project_id=project_id,
         )
     except Exception as e:
@@ -265,7 +320,12 @@ async def _run_semantic_search_and_generate_sql(
 
     await _post_message(
         channel,
-        f"generated SQL:\n```sql\n{sql}\n```",
+        (
+            "generated SQL:\n"
+            f"```sql\n{sql}\n```\n"
+            "vector search results:\n"
+            f"```{json.dumps(search_results, ensure_ascii=False, indent=2)}```"
+        ),
         thread_ts=thread_ts,
     )
 

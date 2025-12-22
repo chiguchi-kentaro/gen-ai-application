@@ -192,6 +192,7 @@ def search_embedding_meta_data(
       top_k => @top_k,
       distance_type => 'COSINE'
     )
+    LIMIT @top_k
     """
 
     job_config = bigquery.QueryJobConfig(
